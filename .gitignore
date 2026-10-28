@@ -1,0 +1,13 @@
+# Never commit client/site data or DJI mission templates
+*.kml
+*.kmz
+*.dng
+*.DNG
+*.jpg
+*.JPG
+*.tif
+# ExifTool binaries (download from exiftool.org)
+exiftool*
+exiftool_files/
+__pycache__/
+*.pyc
