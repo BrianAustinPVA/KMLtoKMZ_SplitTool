@@ -483,7 +483,7 @@ class AreaEditor(tk.Toplevel):
         self._build()
         self.protocol("WM_DELETE_WINDOW", self.close)
         self.bind("<Return>", lambda e: self.finish_cut())
-        self.bind("<Escape>", lambda e: self.cancel_cut())
+        self.bind("<Escape>", lambda e: (self.cancel_cut(), self.clear_measure()))
         self.bind("<Delete>", lambda e: self.delete_selected())
         self.bind("<Control-z>", lambda e: self.undo())
         self.set_path(path)
@@ -500,7 +500,7 @@ class AreaEditor(tk.Toplevel):
         tools = ttk.Frame(self)
         tools.pack(fill="x", padx=8, pady=4)
         ttk.Label(tools, text="Tool:").pack(side="left")
-        for val, txt in (("select", "Select"), ("cut", "Cut line"), ("delete", "Delete")):
+        for val, txt in (("select", "Select"), ("cut", "Cut line"), ("delete", "Delete"), ("measure", "Measure")):
             ttk.Radiobutton(tools, text=txt, value=val, variable=self.mode,
                             command=self._mode_changed).pack(side="left", padx=4)
         self.finish_btn = ttk.Button(tools, text="Finish cut (Enter)", command=self.finish_cut, state="disabled")
@@ -535,6 +535,9 @@ class AreaEditor(tk.Toplevel):
                                  "    python -m pip install tkintermapview",
                       font=("Consolas", 11)).pack(fill="both", expand=True, padx=20, pady=20)
         ttk.Label(self, textvariable=self.status, foreground="#555").pack(anchor="w", padx=10)
+        self.measure_txt = tk.StringVar()
+        ttk.Label(self, textvariable=self.measure_txt, foreground="#0050a0",
+                  font=("Segoe UI", 10, "bold")).pack(anchor="w", padx=10)
         self.summary = tk.Text(self, height=8, bg="#0c0c0c", fg="#7CFC7C", font=("Consolas", 10),
                                relief="flat", state="disabled")
         self.summary.pack(fill="x", padx=8, pady=(2, 8))
@@ -581,10 +584,14 @@ class AreaEditor(tk.Toplevel):
     # ---------- interaction ----------
     def _mode_changed(self):
         self.cancel_cut()
+        if self.mode.get() != "measure":
+            self.clear_measure()
         tips = {"select": "Click pieces to select / unselect them (yellow outline). Drag to pan, scroll to zoom.",
                 "cut": "Click points along your cut line, starting and ending OUTSIDE the area. "
                        "Press Enter (or Finish cut) to cut. Esc cancels.",
-                "delete": "Click a piece to delete it. Ctrl+Z undoes."}
+                "delete": "Click a piece to delete it. Ctrl+Z undoes.",
+                "measure": "Click points to measure distance (each leg + total). 3+ points also shows the "
+                           "enclosed area. Esc clears. Selecting a piece shows its length x width."}
         self.status.set(tips[self.mode.get()])
 
     def _hit(self, lat, lon):
@@ -598,6 +605,12 @@ class AreaEditor(tk.Toplevel):
     def on_click(self, coords):
         lat, lon = coords
         m = self.mode.get()
+        if m == "measure":
+            if not hasattr(self, "meas_pts"):
+                self.meas_pts = []
+            self.meas_pts.append((lon, lat))
+            self._draw_measure()
+            return
         if m == "cut":
             self.cut_pts.append((lon, lat))
             self.finish_btn.config(state="normal" if len(self.cut_pts) >= 2 else "disabled")
@@ -629,6 +642,54 @@ class AreaEditor(tk.Toplevel):
         if len(self.cut_pts) >= 2:
             self.cut_path = self.map.set_path([(lat, lon) for lon, lat in self.cut_pts],
                                               color="#ffff33", width=3)
+
+    @staticmethod
+    def _fmt_len(m_):
+        ft = m_ * 3.28084
+        mi = f" / {m_ / 1609.344:.2f} mi" if m_ >= 400 else ""
+        return f"{m_:,.0f} m / {ft:,.0f} ft{mi}"
+
+    def _measure_values(self):
+        import math
+        xy = [self.proj.fwd(*p) for p in getattr(self, "meas_pts", [])]
+        legs = [math.dist(a, b) for a, b in zip(xy, xy[1:])]
+        area = 0.0
+        if len(xy) >= 3:
+            area = abs(sum(xy[i][0] * xy[(i + 1) % len(xy)][1] - xy[(i + 1) % len(xy)][0] * xy[i][1]
+                           for i in range(len(xy)))) / 2
+        return legs, area
+
+    def _draw_measure(self):
+        legs, area = self._measure_values()
+        pts = getattr(self, "meas_pts", [])
+        if self.map:
+            for obj in getattr(self, "meas_objs", []):
+                obj.delete()
+            self.meas_objs = []
+            run = 0.0
+            for i, (lon, lat) in enumerate(pts):
+                run += legs[i - 1] if i else 0.0
+                label = "start" if i == 0 else self._fmt_len(run)
+                self.meas_objs.append(self.map.set_marker(lat, lon, text=label, text_color="#00e5ff",
+                                                          marker_color_circle="#00e5ff",
+                                                          marker_color_outside="#007a8a",
+                                                          font=("Segoe UI", 10, "bold")))
+            if len(pts) >= 2:
+                self.meas_objs.append(self.map.set_path([(lat, lon) for lon, lat in pts],
+                                                        color="#00e5ff", width=3))
+        if not pts:
+            self.measure_txt.set("")
+            return
+        txt = f"Total: {self._fmt_len(sum(legs))}"
+        if len(legs) > 1:
+            txt += "   |   legs: " + ", ".join(f"{l:,.0f} m" for l in legs)
+        if area:
+            txt += f"   |   enclosed area: {area / 4046.8564224:,.1f} ac"
+        self.measure_txt.set(txt)
+
+    def clear_measure(self):
+        self.meas_pts = []
+        self._draw_measure()
 
     def cancel_cut(self):
         self.cut_pts = []
@@ -787,6 +848,9 @@ class AreaEditor(tk.Toplevel):
                 m.set_marker(lat, lon, text=f"{i + 1}\n{g.area / 4046.8564224:,.0f} ac", icon=self.blank,
                              text_color="#FFFF33", font=("Segoe UI", 11, "bold"))
             self._draw_cut()
+            self.meas_objs = []
+            if getattr(self, "meas_pts", None):
+                self._draw_measure()
             if fit:
                 lons = [p[0] for r in self.original for p in r]
                 lats = [p[1] for r in self.original for p in r]
@@ -798,7 +862,13 @@ class AreaEditor(tk.Toplevel):
                  + (f"Seam overlap of {ov:g} m ({ov * 3.28084:,.0f} ft) is added when you Process."
                     if ov > 0 else "No seam overlap set (main window).")]
         for i, (g, n) in enumerate(zip(self.pieces, names)):
-            mark = "  <- selected" if i in self.selected else ""
+            mark = ""
+            if i in self.selected:
+                import math
+                c = list(g.minimum_rotated_rectangle.exterior.coords)
+                a_, b_ = sorted([math.dist(c[0], c[1]), math.dist(c[1], c[2])])
+                mark = (f"  <- selected: about {b_:,.0f} x {a_:,.0f} m "
+                        f"({b_ * 3.28084:,.0f} x {a_ * 3.28084:,.0f} ft)")
             lines.append(f"  {i + 1:>2}. {n}.kmz   {g.area / 4046.8564224:,.1f} ac{mark}")
         self.summary.configure(state="normal")
         self.summary.delete("1.0", "end")

@@ -13,6 +13,7 @@ only the boundary is swapped in.
 - **Cut big areas:** halve automatically until every piece is under a max acreage
 - **Area Editor (map):** satellite preview; cut with lines, delete, divide into N equal pieces,
   merge, undo; edits saved per file and used when processing ("[MANUAL]")
+- **Measure tool:** click points for distance (m / ft / mi) and enclosed area; selected pieces show length x width
 - **Seam overlap** between touching pieces so separate flights stitch (~100–150 m at 120 m AGL)
 - Batch processing with progress and log
 
