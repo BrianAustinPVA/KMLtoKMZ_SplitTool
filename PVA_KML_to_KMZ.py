@@ -500,10 +500,11 @@ class AreaEditor(tk.Toplevel):
         tools = ttk.Frame(self)
         tools.pack(fill="x", padx=8, pady=4)
         ttk.Label(tools, text="Tool:").pack(side="left")
-        for val, txt in (("select", "Select"), ("cut", "Cut line"), ("delete", "Delete"), ("measure", "Measure")):
+        for val, txt in (("select", "Select"), ("cut", "Cut line"), ("delete", "Delete"),
+                         ("addback", "Add back"), ("draw", "Draw area"), ("measure", "Measure")):
             ttk.Radiobutton(tools, text=txt, value=val, variable=self.mode,
                             command=self._mode_changed).pack(side="left", padx=4)
-        self.finish_btn = ttk.Button(tools, text="Finish cut (Enter)", command=self.finish_cut, state="disabled")
+        self.finish_btn = ttk.Button(tools, text="Finish (Enter)", command=self.finish_cut, state="disabled")
         self.finish_btn.pack(side="left", padx=4)
         ttk.Separator(tools, orient="vertical").pack(side="left", fill="y", padx=8)
         ttk.Label(tools, text="Divide selected into").pack(side="left")
@@ -590,6 +591,10 @@ class AreaEditor(tk.Toplevel):
                 "cut": "Click points along your cut line, starting and ending OUTSIDE the area. "
                        "Press Enter (or Finish cut) to cut. Esc cancels.",
                 "delete": "Click a piece to delete it. Ctrl+Z undoes.",
+                "addback": "Click an EMPTY spot inside the red original boundary (e.g. a deleted corridor) "
+                           "to bring that whole region back as its own piece.",
+                "draw": "Click the corners of a new flight area, then press Enter (or Finish) to create it. "
+                        "Esc cancels. It can be anywhere, even outside the red boundary.",
                 "measure": "Click points to measure distance (each leg + total). 3+ points also shows the "
                            "enclosed area. Esc clears. Selecting a piece shows its length x width."}
         self.status.set(tips[self.mode.get()])
@@ -611,9 +616,13 @@ class AreaEditor(tk.Toplevel):
             self.meas_pts.append((lon, lat))
             self._draw_measure()
             return
-        if m == "cut":
+        if m == "addback":
+            self.add_back(lat, lon)
+            return
+        if m in ("cut", "draw"):
             self.cut_pts.append((lon, lat))
-            self.finish_btn.config(state="normal" if len(self.cut_pts) >= 2 else "disabled")
+            need = 2 if m == "cut" else 3
+            self.finish_btn.config(state="normal" if len(self.cut_pts) >= need else "disabled")
             self._draw_cut()
             return
         i = self._hit(lat, lon)
@@ -640,8 +649,12 @@ class AreaEditor(tk.Toplevel):
                                               marker_color_outside="#c0a000")
                           for lon, lat in self.cut_pts]
         if len(self.cut_pts) >= 2:
-            self.cut_path = self.map.set_path([(lat, lon) for lon, lat in self.cut_pts],
-                                              color="#ffff33", width=3)
+            pts = list(self.cut_pts)
+            if self.mode.get() == "draw" and len(pts) >= 3:
+                pts.append(pts[0])
+            self.cut_path = self.map.set_path([(lat, lon) for lon, lat in pts],
+                                              color="#ffff33" if self.mode.get() == "cut" else "#ff66ff",
+                                              width=3)
 
     @staticmethod
     def _fmt_len(m_):
@@ -696,7 +709,51 @@ class AreaEditor(tk.Toplevel):
         self.finish_btn.config(state="disabled")
         self._draw_cut()
 
+    def add_back(self, lat, lon):
+        from shapely.geometry import Point
+        from shapely.ops import unary_union
+        pt = Point(*self.proj.fwd(lon, lat))
+        if self._hit(lat, lon) is not None:
+            self.status.set("That spot is already covered by a piece - click an empty area inside the red line.")
+            return
+        orig = unary_union(self.orig_geo)
+        if not orig.contains(pt):
+            self.status.set("That spot is outside the original boundary - use Draw area for new areas.")
+            return
+        covered = unary_union([g.buffer(0.05) for g in self.pieces]) if self.pieces else None
+        gaps = orig.difference(covered) if covered is not None else orig
+        hit = [g for g in _polys(gaps, 25.0) if g.buffer(0.5).contains(pt)]
+        if not hit:
+            self.status.set("Nothing to add back there.")
+            return
+        self._push()
+        self.pieces.append(hit[0])
+        self.selected.clear()
+        self.redraw()
+        self.status.set(f"Added back {hit[0].area / 4046.8564224:,.1f} ac. Click another empty spot, or switch tools.")
+
+    def finish_draw(self):
+        from shapely.geometry import Polygon
+        from shapely.validation import make_valid
+        if len(self.cut_pts) < 3:
+            return
+        parts = _polys(make_valid(Polygon([self.proj.fwd(*p) for p in self.cut_pts])), 25.0)
+        if not parts:
+            messagebox.showwarning("Draw area", "That shape has no area - click at least 3 corners.", parent=self)
+            return
+        g = max(parts, key=lambda x: x.area)
+        overlap = sum(g.intersection(o).area for o in self.pieces) / 4046.8564224
+        self._push()
+        self.pieces.append(g)
+        self.selected.clear()
+        self.cancel_cut()
+        self.redraw()
+        note = f" (overlaps other pieces by {overlap:,.1f} ac)" if overlap > 0.05 else ""
+        self.status.set(f"Created a {g.area / 4046.8564224:,.1f} ac area{note}. Draw another, or switch tools.")
+
     def finish_cut(self):
+        if self.mode.get() == "draw":
+            return self.finish_draw()
         if self.mode.get() != "cut" or len(self.cut_pts) < 2:
             return
         from shapely.geometry import LineString
