@@ -13,7 +13,7 @@ only the boundary is swapped in.
 - **Cut big areas:** halve automatically until every piece is under a max acreage
 - **Area Editor (map):** satellite preview; cut with lines, delete, divide into N equal pieces,
   merge, undo; edits saved per file and used when processing ("[MANUAL]")
-- **KML / KMZ Viewer:** open any KMLs, KMZs or DJI missions (or a whole folder) on the satellite map; show/hide, click to identify, flight lines drawn when present
+- **KML / KMZ Viewer:** drag & drop any KMLs, KMZs, DJI missions or folders onto the viewer (or onto `PVA_KML_Viewer.bat`); show/hide, click to identify, flight lines drawn when present
 - **Add back:** click an empty spot inside the original boundary (e.g. a deleted corridor) to restore it as a piece
 - **Draw area:** click corners to create any new flight area
 - **Measure tool:** click points for distance (m / ft / mi) and enclosed area; selected pieces show length x width
@@ -21,7 +21,8 @@ only the boundary is swapped in.
 - Batch processing with progress and log
 
 ## Run
-Double-click `PVA_KML_to_KMZ.bat` (first run installs `shapely` and `tkintermapview`).
+Double-click `PVA_KML_to_KMZ.bat` (first run installs `shapely`, `tkintermapview` and `tkinterdnd2`).
+Drag files onto `PVA_KML_Viewer.bat` to open them straight in the viewer.
 
 ## Notes
 - Flight lines in the output are left empty; FlightHub regenerates them for the new boundary.

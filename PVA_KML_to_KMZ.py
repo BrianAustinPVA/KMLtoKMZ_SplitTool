@@ -1011,10 +1011,48 @@ class Viewer(tk.Toplevel):
         except Exception:
             self.map = None
             ttk.Label(right, text="Viewer needs 'tkintermapview':  python -m pip install tkintermapview").pack(pady=40)
+        self.drop_hint = ttk.Label(left, foreground="#2e7d32", font=("Segoe UI", 10, "bold"))
+        self.drop_hint.pack(anchor="w", pady=(6, 0))
+        self._enable_drop()
         for f in files:
-            self.add_file(f, refresh=False)
+            self.add_path(f, refresh=False)
         self.refresh_list()
         self.zoom_all()
+
+    def _enable_drop(self):
+        try:
+            from tkinterdnd2 import TkinterDnD, DND_FILES
+            TkinterDnD._require(self.app)
+            targets = [self, self.tree] + ([self.map, self.map.canvas] if self.map else [])
+            for w in targets:
+                w.drop_target_register(DND_FILES)
+                w.dnd_bind("<<Drop>>", self._on_drop)
+            self.drop_hint.config(text="Drag & drop KML / KMZ files or folders anywhere in this window.")
+        except Exception:
+            self.drop_hint.config(text="(Drag & drop needs:  python -m pip install tkinterdnd2)",
+                                  foreground="#b36b00")
+
+    def _on_drop(self, event):
+        paths = self.tk.splitlist(event.data)
+        n0 = len(self.items)
+        for p_ in paths:
+            self.add_path(p_, refresh=False)
+        self.refresh_list()
+        if len(self.items) > n0:
+            self._fit([r for it in self.items[n0:] for r in it["info"]["rings"] + [it["info"]["lines"]] if r])
+        return getattr(event, "action", "copy")
+
+    def add_path(self, p_, refresh=True):
+        """File or folder (folders: every KML/KMZ inside, one level of subfolders)."""
+        p_ = Path(p_)
+        if p_.is_dir():
+            for f in list_inputs(p_) + [g for sub in sorted(x for x in p_.iterdir() if x.is_dir())
+                                        for g in list_inputs(sub)]:
+                self.add_file(f, refresh=False)
+        elif p_.suffix.lower() in IN_EXTS:
+            self.add_file(p_, refresh=False)
+        if refresh:
+            self.refresh_list()
 
     # ---------- loading ----------
     def open_files(self):
@@ -1376,8 +1414,9 @@ class App(tk.Tk):
     def open_viewer(self, files=()):
         if getattr(self, "viewer", None) and self.viewer.winfo_exists():
             for f in files:
-                self.viewer.add_file(f, refresh=False)
+                self.viewer.add_path(f, refresh=False)
             self.viewer.refresh_list()
+            self.viewer.zoom_all()
             self.viewer.lift()
         else:
             self.viewer = Viewer(self, files)
@@ -1589,4 +1628,8 @@ class App(tk.Tk):
 
 
 if __name__ == "__main__":
-    App().mainloop()
+    args = [a for a in sys.argv[1:] if not a.startswith("--")]
+    app = App()
+    if args or "--viewer" in sys.argv:
+        app.after(300, lambda: app.open_viewer(args))
+    app.mainloop()
