@@ -933,6 +933,243 @@ class AreaEditor(tk.Toplevel):
         self.summary.configure(state="disabled")
 
 
+def read_flight_file(path):
+    """Read any KML/KMZ (plain or DJI mission). Returns dict with boundary rings,
+    flight-line points (DJI waylines), and a type label."""
+    path = Path(path)
+    info = {"rings": [], "lines": [], "kind": "KML", "settings": ""}
+    if path.suffix.lower() == ".kmz":
+        with zipfile.ZipFile(path) as z:
+            names = z.namelist()
+            if "wpmz/template.kml" in names:
+                info["kind"] = "DJI KMZ"
+                tk_ = z.read("wpmz/template.kml")
+                info["rings"] = [o for _, o, _ in extract_polygons(tk_)]
+                t = tk_.decode("utf-8", "replace")
+                g = lambda tag: (re.search(rf"<wpml:{tag}>([^<]*)<", t) or [None, ""])[1]
+                if g("templateType"):
+                    info["settings"] = (f"{g('templateType')}, {g('globalShootHeight') or g('height')} m, "
+                                        f"drone {g('droneEnumValue')}/payload {g('payloadEnumValue')}")
+                if "wpmz/waylines.wpml" in names:
+                    w = z.read("wpmz/waylines.wpml").decode("utf-8", "replace")
+                    pts = re.findall(r"<Point>\s*<coordinates>\s*([-\d.]+),([-\d.]+)", w)
+                    info["lines"] = [(float(a), float(b)) for a, b in pts]
+                return info
+            info["kind"] = "KMZ"
+    info["rings"] = [o for _, o, _ in extract_polygons(read_kml_text(path))]
+    return info
+
+
+class Viewer(tk.Toplevel):
+    """Open any number of KML/KMZ files and see them on the satellite map."""
+
+    def __init__(self, app, files=()):
+        super().__init__(app)
+        self.app = app
+        self.title("KML / KMZ Viewer")
+        self.geometry("1400x850")
+        self.items = []          # dicts: path, info, color, visible, polys
+        self.blank = tk.PhotoImage(width=1, height=1)
+        self.show_lines = tk.BooleanVar(value=True)
+        self.show_labels = tk.BooleanVar(value=True)
+        bar = ttk.Frame(self)
+        bar.pack(fill="x", padx=8, pady=6)
+        ttk.Button(bar, text="Open files...", command=self.open_files).pack(side="left", padx=3)
+        ttk.Button(bar, text="Open folder...", command=self.open_folder).pack(side="left", padx=3)
+        ttk.Button(bar, text="Show Target Folder", command=lambda: self.add_folder(app.dst_var.get())).pack(side="left", padx=3)
+        ttk.Button(bar, text="Show Source Folder", command=lambda: self.add_folder(app.src_var.get())).pack(side="left", padx=3)
+        ttk.Button(bar, text="Clear", command=self.clear).pack(side="left", padx=3)
+        ttk.Checkbutton(bar, text="Flight lines", variable=self.show_lines, command=self.redraw).pack(side="left", padx=10)
+        ttk.Checkbutton(bar, text="Labels", variable=self.show_labels, command=self.redraw).pack(side="left")
+        ttk.Button(bar, text="Zoom to all", command=self.zoom_all).pack(side="right", padx=3)
+
+        body = ttk.PanedWindow(self, orient="horizontal")
+        body.pack(fill="both", expand=True, padx=8, pady=(0, 8))
+        left = ttk.Frame(body)
+        body.add(left, weight=1)
+        cols = ("vis", "name", "kind", "ac", "lines")
+        self.tree = ttk.Treeview(left, columns=cols, show="headings", selectmode="browse")
+        for c, t, w, a in [("vis", "", 30, "center"), ("name", "File", 300, "w"), ("kind", "Type", 70, "center"),
+                           ("ac", "Acres", 70, "e"), ("lines", "Flight pts", 70, "e")]:
+            self.tree.heading(c, text=t)
+            self.tree.column(c, width=w, anchor=a, stretch=(c == "name"))
+        self.tree.pack(fill="both", expand=True)
+        self.tree.bind("<Button-1>", self._tree_click)
+        self.tree.bind("<<TreeviewSelect>>", lambda e: self.redraw())
+        self.tree.bind("<Double-1>", lambda e: self.zoom_selected())
+        self.detail = ttk.Label(left, foreground="#555", wraplength=480, justify="left")
+        self.detail.pack(fill="x", pady=4)
+        ttk.Label(left, text="Click the box to show/hide. Click a row (or a shape on the map) to highlight it.\n"
+                             "Double-click a row to zoom to it.", foreground="#555").pack(anchor="w")
+        right = ttk.Frame(body)
+        body.add(right, weight=3)
+        try:
+            import tkintermapview
+            self.map = tkintermapview.TkinterMapView(right, corner_radius=0)
+            self.map.set_tile_server(SAT_TILES, max_zoom=19)
+            self.map.pack(fill="both", expand=True)
+        except Exception:
+            self.map = None
+            ttk.Label(right, text="Viewer needs 'tkintermapview':  python -m pip install tkintermapview").pack(pady=40)
+        for f in files:
+            self.add_file(f, refresh=False)
+        self.refresh_list()
+        self.zoom_all()
+
+    # ---------- loading ----------
+    def open_files(self):
+        fs = filedialog.askopenfilenames(parent=self, title="Open KML / KMZ files",
+                                         filetypes=[("KML / KMZ", "*.kml *.kmz"), ("All files", "*.*")])
+        for f in fs:
+            self.add_file(f, refresh=False)
+        self.refresh_list()
+        self.zoom_all()
+
+    def open_folder(self):
+        d = filedialog.askdirectory(parent=self, title="Open a folder of KML / KMZ files")
+        if d:
+            self.add_folder(d)
+
+    def add_folder(self, d):
+        if not d or not Path(d).is_dir():
+            messagebox.showinfo("Viewer", "That folder isn't set or doesn't exist.", parent=self)
+            return
+        for f in list_inputs(d):
+            self.add_file(f, refresh=False)
+        self.refresh_list()
+        self.zoom_all()
+
+    def add_file(self, f, refresh=True):
+        f = str(Path(f))
+        if any(it["path"] == f for it in self.items):
+            return
+        try:
+            info = read_flight_file(f)
+        except Exception as e:
+            info = {"rings": [], "lines": [], "kind": "ERROR", "settings": str(e)}
+        self.items.append({"path": f, "info": info, "visible": True,
+                           "color": PALETTE[len(self.items) % len(PALETTE)]})
+        if refresh:
+            self.refresh_list()
+
+    def clear(self):
+        self.items = []
+        self.refresh_list()
+
+    # ---------- list ----------
+    def _short_names(self):
+        """Map labels: files in a numbered set (name-1, name-2 / 'Flight 4') show just their number;
+        everything else shows its full name."""
+        stems = [Path(it["path"]).stem for it in self.items]
+        parts = [re.match(r"^(.*?)[-_ ]+(\d+)$", s) for s in stems]
+        bases = [p_[1].lower() if p_ else None for p_ in parts]
+        out = []
+        for s_, p_, b_ in zip(stems, parts, bases):
+            if p_ and bases.count(b_) > 1:
+                out.append(p_[2])
+            else:
+                out.append(s_)
+        return out
+
+    def refresh_list(self):
+        sel = self.tree.selection()
+        self.tree.delete(*self.tree.get_children())
+        for i, it in enumerate(self.items):
+            inf = it["info"]
+            ac = sum(ring_area_acres(r) for r in inf["rings"])
+            tag = f"c{i}"
+            self.tree.tag_configure(tag, foreground=it["color"])
+            self.tree.insert("", "end", iid=str(i), tags=(tag,), values=(
+                "☑" if it["visible"] else "☐", Path(it["path"]).name, inf["kind"],
+                f"{ac:,.1f}" if inf["rings"] else "-", len(inf["lines"]) or "-"))
+        for s in sel:
+            if self.tree.exists(s):
+                self.tree.selection_set(s)
+        self.redraw()
+
+    def _tree_click(self, e):
+        row = self.tree.identify_row(e.y)
+        if row and self.tree.identify_column(e.x) == "#1":
+            it = self.items[int(row)]
+            it["visible"] = not it["visible"]
+            vals = list(self.tree.item(row, "values"))
+            vals[0] = "☑" if it["visible"] else "☐"
+            self.tree.item(row, values=vals)
+            self.redraw()
+            return "break"
+
+    def _selected(self):
+        s = self.tree.selection()
+        return int(s[0]) if s else None
+
+    def _select_from_map(self, i):
+        self.tree.selection_set(str(i))
+        self.tree.see(str(i))
+
+    # ---------- map ----------
+    def redraw(self):
+        sel = self._selected()
+        if sel is not None and sel < len(self.items):
+            it = self.items[sel]
+            inf = it["info"]
+            ac = sum(ring_area_acres(r) for r in inf["rings"])
+            self.detail.config(text=f"{Path(it['path']).name}\n{it['path']}\n{inf['kind']}: "
+                                    f"{len(inf['rings'])} boundary, {ac:,.1f} ac"
+                                    + (f"\n{inf['settings']}" if inf["settings"] else "")
+                                    + ("\nFlight lines: none (FlightHub generates them)" if inf["kind"] == "DJI KMZ"
+                                       and not inf["lines"] else ""))
+        else:
+            self.detail.config(text="")
+        if not self.map:
+            return
+        m = self.map
+        m.delete_all_polygon()
+        m.delete_all_marker()
+        m.delete_all_path()
+        short = self._short_names()
+        order = [i for i in range(len(self.items)) if i != sel] + ([sel] if sel is not None else [])
+        for i in order:
+            it = self.items[i]
+            if not it["visible"]:
+                continue
+            hl = i == sel
+            for ring in it["info"]["rings"]:
+                m.set_polygon([(lat, lon) for lon, lat in ring], fill_color=it["color"],
+                              outline_color="#ffff33" if hl else it["color"], border_width=5 if hl else 3,
+                              command=lambda poly, i=i: self._select_from_map(i))
+                if self.show_labels.get():
+                    try:
+                        from shapely.geometry import Polygon
+                        rp = Polygon(ring).representative_point()
+                        cx, cy = rp.x, rp.y
+                    except Exception:
+                        cx = sum(p[0] for p in ring) / len(ring)
+                        cy = sum(p[1] for p in ring) / len(ring)
+                    m.set_marker(cy, cx, text=short[i], icon=self.blank,
+                                 text_color="#ffff33" if hl else "#ffffff", font=("Segoe UI", 12, "bold"))
+            if self.show_lines.get() and len(it["info"]["lines"]) >= 2:
+                m.set_path([(lat, lon) for lon, lat in it["info"]["lines"]],
+                           color="#ffff33" if hl else it["color"], width=2)
+
+    def _fit(self, rings):
+        pts = [p for r in rings for p in r]
+        if not pts or not self.map:
+            return
+        lons = [p[0] for p in pts]
+        lats = [p[1] for p in pts]
+        pad = 0.08 * max(max(lons) - min(lons), max(lats) - min(lats), 2e-4)
+        self.map.fit_bounding_box((max(lats) + pad, min(lons) - pad), (min(lats) - pad, max(lons) + pad))
+
+    def zoom_all(self):
+        self._fit([r for it in self.items if it["visible"] for r in it["info"]["rings"] + [it["info"]["lines"]] if r])
+
+    def zoom_selected(self):
+        s = self._selected()
+        if s is not None:
+            it = self.items[s]
+            self._fit([r for r in it["info"]["rings"] + [it["info"]["lines"]] if r])
+
+
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
@@ -1082,13 +1319,15 @@ class App(tk.Tk):
 
         bf = ttk.Frame(self)
         bf.pack(fill="x", padx=10, pady=6)
-        bf.columnconfigure((0, 1, 2), weight=1, uniform="b")
+        bf.columnconfigure((0, 1, 2, 3), weight=1, uniform="b")
         self.process_btn = ttk.Button(bf, text="Process (0) Files", command=self.start)
         self.process_btn.grid(row=0, column=0, sticky="ew", padx=4, ipady=6)
         ttk.Button(bf, text="Preview / Edit Areas on Map", command=self.open_preview).grid(
             row=0, column=1, sticky="ew", padx=4, ipady=6)
-        ttk.Button(bf, text="Open Target Folder", command=self.open_target).grid(
+        ttk.Button(bf, text="KML / KMZ Viewer", command=self.open_viewer).grid(
             row=0, column=2, sticky="ew", padx=4, ipady=6)
+        ttk.Button(bf, text="Open Target Folder", command=self.open_target).grid(
+            row=0, column=3, sticky="ew", padx=4, ipady=6)
 
         ttk.Label(self, text="Processing Log:", style="Bold.TLabel").pack(anchor="w", padx=10)
         lf = ttk.Frame(self)
@@ -1133,6 +1372,15 @@ class App(tk.Tk):
             return max(1.0, float(self.strip_m.get()))
         except Exception:
             return 100.0
+
+    def open_viewer(self, files=()):
+        if getattr(self, "viewer", None) and self.viewer.winfo_exists():
+            for f in files:
+                self.viewer.add_file(f, refresh=False)
+            self.viewer.refresh_list()
+            self.viewer.lift()
+        else:
+            self.viewer = Viewer(self, files)
 
     def open_preview(self, path=None):
         if not path:
@@ -1305,6 +1553,14 @@ class App(tk.Tk):
         self.progress_txt.set("Progress: 100% (Complete)")
         self.log(f"--- Workflow Complete --- {counts['ok']} ok, {counts['warn']} warnings, "
                  f"{counts['fail']} failed, {counts['skip']} skipped")
+        if counts["skip"] and counts["ok"] + counts["warn"]:
+            self.log("WARNING: some KMZs were SKIPPED because files with those names already existed. "
+                     "The target folder now MIXES old and new pieces - numbers may not match the editor. "
+                     "Tick 'Overwrite existing KMZs' and Process again, or use a new Target Folder.", "fail")
+            messagebox.showwarning(APP_NAME, f"{counts['skip']} KMZ(s) were skipped because they already existed.\n\n"
+                                   "The target folder now mixes OLD and NEW pieces, so the numbers may not "
+                                   "match what you see in the editor.\n\nTick 'Overwrite existing KMZs' and "
+                                   "Process again (or pick an empty Target Folder).")
         self._refresh_count()
 
     def _load_settings(self):
