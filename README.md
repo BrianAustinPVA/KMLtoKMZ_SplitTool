@@ -14,6 +14,7 @@ only the boundary is swapped in.
 - **Area Editor (map):** satellite preview; cut with lines, delete, divide into N equal pieces,
   merge, undo; edits saved per file and used when processing ("[MANUAL]")
 - **KML / KMZ Viewer:** drag & drop any KMLs, KMZs, DJI missions or folders onto the viewer (or onto `PVA_KML_Viewer.bat`); show/hide, click to identify, flight lines drawn when present
+- **Find takeoff spots:** best line-of-sight point inside the area plus mapped roads/parking inside it (OpenStreetMap), ranked by distance to the farthest edge; copy coords, open in Google Maps, directions
 - **Add back:** click an empty spot inside the original boundary (e.g. a deleted corridor) to restore it as a piece
 - **Draw area:** click corners to create any new flight area
 - **Measure tool:** click points for distance (m / ft / mi) and enclosed area; selected pieces show length x width

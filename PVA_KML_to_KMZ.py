@@ -522,6 +522,7 @@ class AreaEditor(tk.Toplevel):
         ttk.Button(tools2, text="Reset to automatic", command=self.reset_auto).pack(side="left", padx=3)
         ttk.Button(tools2, text="Restore original boundary", command=self.reset_original).pack(side="left", padx=3)
         ttk.Button(tools2, text="Save edits for this file", command=self.save).pack(side="right", padx=3)
+        ttk.Button(tools2, text="Find takeoff spots", command=self.find_takeoff).pack(side="left", padx=12)
         ttk.Button(tools2, text="Discard edits", command=self.discard).pack(side="right", padx=3)
 
         try:
@@ -779,6 +780,20 @@ class AreaEditor(tk.Toplevel):
         self.redraw()
         self.status.set(f"Cut {n_cut} piece(s). Draw another line, or switch tools.")
 
+    def find_takeoff(self):
+        if len(self.selected) == 1:
+            i = next(iter(self.selected))
+        elif len(self.pieces) == 1:
+            i = 0
+        else:
+            messagebox.showinfo("Takeoff spots", "Select ONE piece (Select tool), then click Find takeoff spots.",
+                                parent=self)
+            return
+        ring = self.proj.to_ring(self.pieces[i])
+        if getattr(self, "takeoff_win", None) and self.takeoff_win.winfo_exists():
+            self.takeoff_win.close()
+        self.takeoff_win = TakeoffWindow(self, ring, f"piece {i + 1}")
+
     def divide_selected(self):
         if not self.selected:
             messagebox.showinfo("Divide", "Select one or more pieces first (Select tool).", parent=self)
@@ -905,6 +920,8 @@ class AreaEditor(tk.Toplevel):
                 m.set_marker(lat, lon, text=f"{i + 1}\n{g.area / 4046.8564224:,.0f} ac", icon=self.blank,
                              text_color="#FFFF33", font=("Segoe UI", 11, "bold"))
             self._draw_cut()
+            if getattr(self, "takeoff_win", None) and self.takeoff_win.winfo_exists():
+                self.takeoff_win.draw_pins()
             self.meas_objs = []
             if getattr(self, "meas_pts", None):
                 self._draw_measure()
@@ -931,6 +948,273 @@ class AreaEditor(tk.Toplevel):
         self.summary.delete("1.0", "end")
         self.summary.insert("end", "\n".join(lines))
         self.summary.configure(state="disabled")
+
+
+OVERPASS_URLS = ["https://overpass-api.de/api/interpreter",
+                 "https://overpass.kumi.systems/api/interpreter"]
+
+
+def _max_dist(pt, verts):
+    import math
+    return max(math.dist(pt, v) for v in verts)
+
+
+def best_los_point(g):
+    """Point INSIDE polygon g (metres) that minimises the farthest distance to the boundary
+    (= best spot to keep the whole area in line of sight). Returns ((x, y), radius_m)."""
+    from shapely.geometry import Point
+    from shapely.prepared import prep
+    verts = list(g.exterior.coords)
+    inner = g.buffer(-15) if g.buffer(-15).area > 0 else g
+    pg = prep(inner)
+    minx, miny, maxx, maxy = g.bounds
+    best, best_r = None, float("inf")
+    step = max(maxx - minx, maxy - miny) / 40
+    cx = cy = None
+    for _ in range(4):
+        xs = [minx + i * step for i in range(int((maxx - minx) / step) + 2)]
+        ys = [miny + j * step for j in range(int((maxy - miny) / step) + 2)]
+        for x in xs:
+            for y in ys:
+                if pg.contains(Point(x, y)):
+                    r = _max_dist((x, y), verts)
+                    if r < best_r:
+                        best, best_r = (x, y), r
+        if best is None:
+            rp = g.representative_point()
+            return (rp.x, rp.y), _max_dist((rp.x, rp.y), verts)
+        cx, cy = best
+        minx, maxx, miny, maxy = cx - 2 * step, cx + 2 * step, cy - 2 * step, cy + 2 * step
+        step /= 5
+    return best, best_r
+
+
+def fetch_osm_access(ring, timeout=40):
+    """Roads, tracks and parking inside the ring's bounding box from OpenStreetMap (Overpass)."""
+    import json as _json
+    import urllib.parse
+    import urllib.request
+    lons = [p[0] for p in ring]
+    lats = [p[1] for p in ring]
+    bbox = f"{min(lats):.6f},{min(lons):.6f},{max(lats):.6f},{max(lons):.6f}"
+    q = (f'[out:json][timeout:{timeout}];('
+         f'way["highway"]({bbox});way["amenity"="parking"]({bbox});node["amenity"="parking"]({bbox});'
+         f');out geom;')
+    data = urllib.parse.urlencode({"data": q}).encode()
+    last = None
+    for url in OVERPASS_URLS:
+        try:
+            req = urllib.request.Request(url, data=data,
+                                         headers={"User-Agent": "PVA-KML-to-KMZ/1.0 (takeoff spot finder)"})
+            with urllib.request.urlopen(req, timeout=timeout + 10) as r:
+                return _json.loads(r.read().decode("utf-8"))
+        except Exception as e:
+            last = e
+    raise RuntimeError(f"OpenStreetMap lookup failed: {last}")
+
+
+ACCESS_RANK = {"parking": 0, "track": 1, "service": 1, "construction": 1, "unclassified": 2,
+               "residential": 2, "tertiary": 3, "secondary": 4, "primary": 5}
+
+
+def takeoff_candidates(ring, osm=None, n=5, min_sep_m=250):
+    """Rank takeoff spots INSIDE the ring. Returns list of dicts sorted best first.
+    The first entry is always the geometric best line-of-sight point."""
+    import math
+    from shapely.geometry import LineString, Point
+    proj = LocalProj([ring])
+    g = proj.to_poly(ring)
+    if g.geom_type != "Polygon":
+        g = max(_polys(g), key=lambda x: x.area)
+    verts = list(g.exterior.coords)
+    inside = g.buffer(-10) if g.buffer(-10).area > 0 else g
+    (bx, by), br = best_los_point(g)
+    blon, blat = proj.inv(bx, by)
+    spots = [{"kind": "Best line of sight", "name": "geometric best spot - check imagery for access",
+              "lat": blat, "lon": blon, "los_m": br, "access": False}]
+    cands = []
+    for el in (osm or {}).get("elements", []):
+        tags = el.get("tags", {})
+        if tags.get("amenity") == "parking":
+            kind, name = "Parking", tags.get("name", "parking lot")
+        elif "highway" in tags:
+            hw = tags["highway"]
+            if hw in ("motorway", "motorway_link", "trunk", "trunk_link", "footway", "path", "cycleway",
+                      "steps", "bridleway", "corridor", "proposed", "platform"):
+                continue
+            kind, name = f"Road ({hw})", tags.get("name") or tags.get("ref") or f"unnamed {hw}"
+        else:
+            continue
+        rank = ACCESS_RANK.get("parking" if kind == "Parking" else tags.get("highway"), 3)
+        if el.get("type") == "node":
+            pts = [proj.fwd(el["lon"], el["lat"])]
+        else:
+            geom = [proj.fwd(p["lon"], p["lat"]) for p in el.get("geometry", []) if p]
+            if len(geom) < 2:
+                pts = geom
+            elif kind == "Parking":
+                pts = [LineString(geom).centroid.coords[0]]
+            else:
+                ln = LineString(geom)
+                k = max(1, int(ln.length // 30))
+                pts = [ln.interpolate(i / k, normalized=True).coords[0] for i in range(k + 1)]
+        for x, y in pts:
+            if inside.contains(Point(x, y)):
+                cands.append((_max_dist((x, y), verts), rank, kind, name, x, y))
+    cands.sort(key=lambda c: (round(c[0] / 50), c[1]))   # line of sight first, then easier access
+    chosen = []
+    for r, rank, kind, name, x, y in cands:
+        if all(math.dist((x, y), (c[4], c[5])) >= min_sep_m for c in chosen):
+            chosen.append((r, rank, kind, name, x, y))
+        if len(chosen) >= n:
+            break
+    for r, rank, kind, name, x, y in chosen:
+        lon, lat = proj.inv(x, y)
+        spots.append({"kind": kind, "name": name, "lat": lat, "lon": lon, "los_m": r, "access": True,
+                      "from_best_m": math.dist((x, y), (bx, by))})
+    return spots
+
+
+class TakeoffWindow(tk.Toplevel):
+    """Lists takeoff spots for one area and pins them on the owner's map."""
+
+    def __init__(self, owner, ring, title):
+        super().__init__(owner)
+        self.owner, self.ring = owner, ring
+        self.title(f"Takeoff spots - {title}")
+        self.geometry("860x330")
+        self.spots = []
+        self.blank = tk.PhotoImage(width=1, height=1)
+        self.msg = tk.StringVar(value="Finding the best line-of-sight spot and nearby roads/parking "
+                                      "(OpenStreetMap)...")
+        ttk.Label(self, textvariable=self.msg, foreground="#555", wraplength=820).pack(anchor="w", padx=8, pady=6)
+        cols = ("id", "kind", "name", "los", "coords")
+        self.tree = ttk.Treeview(self, columns=cols, show="headings", height=7, selectmode="browse")
+        for c, t, w, a in [("id", "#", 34, "center"), ("kind", "Type", 140, "w"), ("name", "Where", 250, "w"),
+                           ("los", "Farthest edge", 150, "e"), ("coords", "Coordinates", 190, "w")]:
+            self.tree.heading(c, text=t)
+            self.tree.column(c, width=w, anchor=a, stretch=(c == "name"))
+        self.tree.pack(fill="both", expand=True, padx=8)
+        self.tree.bind("<<TreeviewSelect>>", lambda e: self.draw_pins())
+        self.tree.bind("<Double-1>", lambda e: self.zoom())
+        bf = ttk.Frame(self)
+        bf.pack(fill="x", padx=8, pady=6)
+        for txt, fn in (("Copy coordinates", self.copy), ("Open in Google Maps", self.open_maps),
+                        ("Directions", self.directions), ("Zoom to", self.zoom), ("Copy all", self.copy_all)):
+            ttk.Button(bf, text=txt, command=fn).pack(side="left", padx=3)
+        self.protocol("WM_DELETE_WINDOW", self.close)
+        import queue as _q
+        import threading
+        self._result = _q.Queue()
+        threading.Thread(target=self._work, daemon=True).start()
+        self.after(200, self._poll)
+
+    def _work(self):
+        # runs in a background thread: NO Tk calls in here
+        osm, err = None, None
+        try:
+            osm = fetch_osm_access(self.ring)
+        except Exception as e:
+            err = e
+        try:
+            spots = takeoff_candidates(self.ring, osm)
+        except Exception as e:
+            spots, err = [], e
+        self._result.put((spots, err))
+
+    def _poll(self):
+        import queue as _q
+        try:
+            spots, err = self._result.get_nowait()
+        except _q.Empty:
+            if self.winfo_exists():
+                self.after(200, self._poll)
+            return
+        self._done(spots, err)
+
+    def _done(self, spots, err):
+        if not self.winfo_exists():
+            return
+        self.spots = spots
+        for i, s in enumerate(spots):
+            los = f"{s['los_m']:,.0f} m / {s['los_m'] * 3.28084:,.0f} ft"
+            self.tree.insert("", "end", iid=str(i), values=(
+                "★" if i == 0 else f"T{i}", s["kind"], s["name"], los, f"{s['lat']:.6f}, {s['lon']:.6f}"))
+        n_access = sum(1 for s in spots if s["access"])
+        if err and not spots:
+            self.msg.set(f"Couldn't compute spots: {err}")
+        elif err:
+            self.msg.set("Road/parking lookup failed (no internet?) - showing the best line-of-sight spot only. "
+                         "'Farthest edge' = distance to the farthest corner of the area.")
+        elif n_access == 0:
+            self.msg.set("No mapped roads or parking inside this area - use ★ and check the satellite "
+                         "imagery for haul roads / open dirt. 'Farthest edge' = distance to the farthest corner.")
+        else:
+            self.msg.set(f"★ = best line of sight (may not be drivable). T1-T{n_access} = mapped roads/parking "
+                         "INSIDE the area, best line of sight first. Always confirm on the imagery.")
+        if spots:
+            self.tree.selection_set("0")
+        self.draw_pins()
+
+    def _sel(self):
+        s = self.tree.selection()
+        return self.spots[int(s[0])] if s and self.spots else None
+
+    def draw_pins(self):
+        m = getattr(self.owner, "map", None)
+        if not m:
+            return
+        for p in getattr(self, "pins", []):
+            p.delete()
+        self.pins = []
+        sel = self._sel()
+        for i, s in enumerate(self.spots):
+            hl = s is sel
+            self.pins.append(m.set_marker(
+                s["lat"], s["lon"], text="★ best LOS" if i == 0 else f"T{i}",
+                text_color="#ffff33" if hl else "#ffffff",
+                marker_color_circle="#ffff33" if hl else ("#ff9800" if i == 0 else "#00c853"),
+                marker_color_outside="#c0a000" if hl else ("#b26a00" if i == 0 else "#007a33"),
+                font=("Segoe UI", 11, "bold")))
+
+    def copy(self):
+        s = self._sel()
+        if s:
+            self.clipboard_clear()
+            self.clipboard_append(f"{s['lat']:.6f}, {s['lon']:.6f}")
+            self.msg.set(f"Copied {s['lat']:.6f}, {s['lon']:.6f} - paste it into Google Maps.")
+
+    def copy_all(self):
+        lines = [f"{'BEST LOS' if i == 0 else 'T' + str(i)}: {s['lat']:.6f}, {s['lon']:.6f}  "
+                 f"({s['kind']} - {s['name']}, farthest edge {s['los_m']:,.0f} m)"
+                 for i, s in enumerate(self.spots)]
+        self.clipboard_clear()
+        self.clipboard_append("\n".join(lines))
+        self.msg.set(f"Copied {len(lines)} spots.")
+
+    def open_maps(self):
+        import webbrowser
+        s = self._sel()
+        if s:
+            webbrowser.open(f"https://www.google.com/maps/search/?api=1&query={s['lat']:.6f},{s['lon']:.6f}")
+
+    def directions(self):
+        import webbrowser
+        s = self._sel()
+        if s:
+            webbrowser.open(f"https://www.google.com/maps/dir/?api=1&destination={s['lat']:.6f},{s['lon']:.6f}")
+
+    def zoom(self):
+        s = self._sel()
+        m = getattr(self.owner, "map", None)
+        if s and m:
+            m.set_position(s["lat"], s["lon"])
+            m.set_zoom(17)
+
+    def close(self):
+        for p in getattr(self, "pins", []):
+            p.delete()
+        self.destroy()
 
 
 def read_flight_file(path):
@@ -982,6 +1266,7 @@ class Viewer(tk.Toplevel):
         ttk.Checkbutton(bar, text="Flight lines", variable=self.show_lines, command=self.redraw).pack(side="left", padx=10)
         ttk.Checkbutton(bar, text="Labels", variable=self.show_labels, command=self.redraw).pack(side="left")
         ttk.Button(bar, text="Zoom to all", command=self.zoom_all).pack(side="right", padx=3)
+        ttk.Button(bar, text="Find takeoff spots", command=self.find_takeoff).pack(side="right", padx=3)
 
         body = ttk.PanedWindow(self, orient="horizontal")
         body.pack(fill="both", expand=True, padx=8, pady=(0, 8))
@@ -1188,6 +1473,20 @@ class Viewer(tk.Toplevel):
             if self.show_lines.get() and len(it["info"]["lines"]) >= 2:
                 m.set_path([(lat, lon) for lon, lat in it["info"]["lines"]],
                            color="#ffff33" if hl else it["color"], width=2)
+        if getattr(self, "takeoff_win", None) and self.takeoff_win.winfo_exists():
+            self.takeoff_win.draw_pins()
+
+    def find_takeoff(self):
+        s = self._selected()
+        if s is None or not self.items[s]["info"]["rings"]:
+            messagebox.showinfo("Takeoff spots", "Click a file in the list (or its shape on the map) first.",
+                                parent=self)
+            return
+        it = self.items[s]
+        ring = max(it["info"]["rings"], key=ring_area_acres)
+        if getattr(self, "takeoff_win", None) and self.takeoff_win.winfo_exists():
+            self.takeoff_win.close()
+        self.takeoff_win = TakeoffWindow(self, ring, Path(it["path"]).name)
 
     def _fit(self, rings):
         pts = [p for r in rings for p in r]
